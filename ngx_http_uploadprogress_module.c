@@ -30,6 +30,7 @@ struct ngx_http_uploadprogress_node_s {
     ngx_uint_t                       err_status;
     off_t                            rest;
     off_t                            length;
+    size_t                           limit_rate;
     ngx_uint_t                       done;
     time_t                           timeout;
     struct ngx_http_uploadprogress_node_s *prev;
@@ -66,10 +67,15 @@ typedef struct {
     ngx_array_t                      templates;
     ngx_str_t                        header;
     ngx_str_t                        jsonp_parameter;
+
+    ngx_array_t                     *limit_rate_lengths;
+    ngx_array_t                     *limit_rate_values;
 } ngx_http_uploadprogress_conf_t;
 
 typedef struct {
     ngx_http_event_handler_pt        read_event_handler;
+    size_t                           limit_rate;
+    u_char                           stringified_limit_rate[NGX_SIZE_T_LEN];
 } ngx_http_uploadprogress_module_ctx_t;
 
 static ngx_int_t ngx_http_reportuploads_handler(ngx_http_request_t *r);
@@ -90,12 +96,16 @@ static ngx_int_t ngx_http_uploadprogress_status_variable(ngx_http_request_t *r,
 static ngx_int_t ngx_http_uploadprogress_callback_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static char* ngx_http_upload_progress_set_template(ngx_conf_t * cf, ngx_http_uploadprogress_template_t *t, ngx_str_t *source);
+static ngx_int_t ngx_http_uploadprogress_limit_rate_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+
 static char *ngx_http_track_uploads(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
 static char *ngx_http_report_uploads(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
 static char *ngx_http_upload_progress(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
 static char* ngx_http_upload_progress_template(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
 static char* ngx_http_upload_progress_json_output(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
 static char* ngx_http_upload_progress_jsonp_output(ngx_conf_t * cf, ngx_command_t * cmd, void *conf);
+static char* ngx_http_upload_progress_limit_rate(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_clean_old_connections(ngx_event_t * ev);
 static ngx_int_t ngx_http_uploadprogress_content_handler(ngx_http_request_t *r);
 
@@ -166,6 +176,13 @@ static ngx_command_t ngx_http_uploadprogress_commands[] = {
      offsetof(ngx_http_uploadprogress_conf_t, jsonp_parameter),
      NULL},
 
+    {ngx_string("upload_progress_limit_rate"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_http_upload_progress_limit_rate,
+     NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_uploadprogress_conf_t, header),
+     NULL},
+
     ngx_null_command
 };
 
@@ -189,6 +206,10 @@ static ngx_http_variable_t  ngx_http_uploadprogress_variables[] = {
 
     { ngx_string("uploadprogress_callback"), NULL, ngx_http_uploadprogress_callback_variable,
       (uintptr_t) NULL,
+      NGX_HTTP_VAR_CHANGEABLE|NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_NOHASH, 0 },
+
+    { ngx_string("uploadprogress_limit_rate"), NULL, ngx_http_uploadprogress_limit_rate_variable,
+      (uintptr_t) offsetof(ngx_http_uploadprogress_module_ctx_t, limit_rate),
       NGX_HTTP_VAR_CHANGEABLE|NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_NOHASH, 0 },
 
     { ngx_null_string, NULL, NULL, 0, 0, 0 }
@@ -476,24 +497,14 @@ static void ngx_http_uploadprogress_event_handler(ngx_http_request_t *r)
                    "upload-progress: read_event_handler found id: %V", id);
     upcf = ngx_http_get_module_loc_conf(r, ngx_http_uploadprogress_module);
     shm_zone = upcf->shm_zone;
-    
-    /* call the original read event handler */
+
     module_ctx = ngx_http_get_module_ctx(r, ngx_http_uploadprogress_module);
-    if (module_ctx != NULL ) {
-        module_ctx->read_event_handler(r);
-    }
-
-    /* at this stage, r is not anymore safe to use */
-    /* the request could have been closed/freed behind our back */
-    /* and thats the same issue with any other material that was allocated in the request pool */
-    /* that's why we duplicate id afterward */
-
-    /* it's also possible that the id was null if we got a spurious (like abort) read */
-    /* event. In this case we still have called the original read event handler */
-    /* but we have to bail out, because we won't ever be able to find our upload node */
-
 
     if (shm_zone == NULL) {
+        if (module_ctx != NULL) {
+            module_ctx->read_event_handler(r);
+        }
+
         ngx_http_uploadprogress_strdupfree(id);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                        "upload-progress: read_event_handler no shm_zone for id: %V", id);
@@ -508,6 +519,31 @@ static void ngx_http_uploadprogress_event_handler(ngx_http_request_t *r)
     ngx_shmtx_lock(&shpool->mutex);
 
     up = find_node(id, ctx, ngx_cycle->log);
+
+    if(up != NULL) {
+        module_ctx->limit_rate = up->limit_rate;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "upload-progress: read_event_handler storing limit_rate %uz for %V", module_ctx->limit_rate, id);
+    }
+
+    ngx_shmtx_unlock(&shpool->mutex);
+    
+    /* call the original read event handler */
+    if (module_ctx != NULL ) {
+        module_ctx->read_event_handler(r);
+    }
+
+    /* at this stage, r is not anymore safe to use */
+    /* the request could have been closed/freed behind our back */
+    /* and thats the same issue with any other material that was allocated in the request pool */
+    /* that's why we duplicate id afterward */
+
+    /* it's also possible that the id was null if we got a spurious (like abort) read */
+    /* event. In this case we still have called the original read event handler */
+    /* but we have to bail out, because we won't ever be able to find our upload node */
+
+    ngx_shmtx_lock(&shpool->mutex);
+
     if (up != NULL && !up->done) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                        "upload-progress: read_event_handler found node: %V", id);
@@ -520,8 +556,43 @@ static void ngx_http_uploadprogress_event_handler(ngx_http_request_t *r)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                        "upload-progress: read_event_handler not found: %V", id);
     }
+
     ngx_shmtx_unlock(&shpool->mutex);
+
     ngx_http_uploadprogress_strdupfree(id);
+}
+
+static ngx_int_t
+ngx_http_uploadprogress_eval_limit_rate(ngx_http_request_t *r, ngx_http_uploadprogress_conf_t *upcf, size_t *limit_rate)
+{
+    ngx_str_t                            limit_rate_str;
+
+    if(limit_rate == NULL) {
+        return NGX_OK;
+    }
+
+    if(upcf->limit_rate_lengths != NULL) {
+        if(ngx_http_script_run(r, &limit_rate_str, upcf->limit_rate_lengths->elts, 0,
+                                upcf->limit_rate_values->elts)
+            == NULL)
+        {
+            return NGX_ERROR;
+        }
+
+        *limit_rate = ngx_parse_size(&limit_rate_str);
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "upload-progress: rate limit is set to %uz", *limit_rate);
+    
+        if(*limit_rate == (size_t) NGX_ERROR) {
+            return NGX_ERROR;
+        }
+    }
+    else {
+        *limit_rate = 0;
+    }
+
+    return NGX_OK;
 }
 
 /* This generates the response for the report */
@@ -541,6 +612,7 @@ ngx_http_reportuploads_handler(ngx_http_request_t * r)
     ngx_table_elt_t                 *expires, *cc, **ccp;
     ngx_http_uploadprogress_state_t  state;
     ngx_http_uploadprogress_template_t  *t;
+    size_t                           limit_rate;
 
     if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
         return NGX_HTTP_NOT_ALLOWED;
@@ -567,6 +639,14 @@ ngx_http_reportuploads_handler(ngx_http_request_t * r)
 
     upcf = ngx_http_get_module_loc_conf(r, ngx_http_uploadprogress_module);
 
+    /*
+     * Evaluate rate limit from arguments/whatever and store it into
+     * limit_rate variable
+     */
+    if(ngx_http_uploadprogress_eval_limit_rate(r, upcf, &limit_rate) != NGX_OK) {
+        limit_rate = 0;
+    }
+
     if (upcf->shm_zone == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "reportuploads no shm_zone for id: %V", id);
@@ -589,6 +669,7 @@ ngx_http_reportuploads_handler(ngx_http_request_t * r)
         length = up->length;
         done = up->done;
         err_status = up->err_status;
+        up->limit_rate = limit_rate;
         found = 1;
     } else {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -825,6 +906,7 @@ ngx_http_uploadprogress_handler(ngx_http_request_t * r)
     up->done = 0;
     up->rest = 0;
     up->length = 0;
+    up->limit_rate = 0;
     up->timeout = 0;
 
     up->next = ctx->list_head.next;
@@ -1299,6 +1381,11 @@ ngx_http_uploadprogress_merge_loc_conf(ngx_conf_t * cf, void *parent, void *chil
     ngx_conf_merge_str_value(conf->header, prev->header, "X-Progress-ID");
     ngx_conf_merge_str_value(conf->jsonp_parameter, prev->jsonp_parameter, "callback");
 
+    if(conf->limit_rate_lengths == NULL) {
+        conf->limit_rate_lengths = prev->limit_rate_lengths;
+        conf->limit_rate_values = prev->limit_rate_values;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -1601,6 +1688,41 @@ ngx_http_upload_progress_jsonp_output(ngx_conf_t * cf, ngx_command_t * cmd, void
     return NGX_CONF_OK;
 }
 
+static char*
+ngx_http_upload_progress_limit_rate(ngx_conf_t * cf, ngx_command_t * cmd, void *conf)
+{
+    ngx_http_uploadprogress_conf_t       *upcf = conf;
+    ngx_str_t                            *value;
+    ngx_http_script_compile_t             sc;
+    ngx_int_t                             n;
+
+    value = cf->args->elts;
+
+    n = ngx_http_script_variables_count(&value[1]);
+
+    if(n == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "upload_progress_limit_rate directive must have variables in the argument");
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
+
+    sc.cf = cf;
+    sc.source = &value[1];
+    sc.lengths = &upcf->limit_rate_lengths;
+    sc.values = &upcf->limit_rate_values;
+    sc.variables = n;
+    sc.complete_lengths = 1;
+    sc.complete_values = 1;
+
+    if (ngx_http_script_compile(&sc) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 static ngx_int_t ngx_http_uploadprogress_received_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
@@ -1645,6 +1767,28 @@ static ngx_int_t ngx_http_uploadprogress_offset_variable(ngx_http_request_t *r,
     v->len = ngx_sprintf(p, "%O", *value) - p;
     v->valid = 1;
     v->no_cacheable = 0;
+    v->not_found = 0;
+    v->data = p;
+
+    return NGX_OK;
+}
+
+static ngx_int_t ngx_http_uploadprogress_limit_rate_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_uploadprogress_module_ctx_t  *ctx;
+    u_char                                *p;
+    size_t                                *value;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_uploadprogress_module);
+
+    value = (size_t *) ((char *) ctx + data);
+
+    p = ctx->stringified_limit_rate;
+
+    v->len = ngx_sprintf(p, "%uz", *value) - p;
+    v->valid = 1;
+    v->no_cacheable = 1;
     v->not_found = 0;
     v->data = p;
 
